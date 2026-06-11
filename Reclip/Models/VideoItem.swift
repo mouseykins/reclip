@@ -21,7 +21,6 @@ class VideoItem: Identifiable {
     var durationSeconds: Double = 0
     var availableQualities: [VideoQuality] = []
     var selectedQuality: VideoQuality?
-    var youtubeVideoID: String?
 
     // Local preview file for native player scrubbing
     var previewFileURL: URL?
@@ -37,9 +36,12 @@ class VideoItem: Identifiable {
     var recentDownloads: [URL] = []
     var lastDownloadError: String?
 
+    // Live download stats (from yt-dlp progress output)
+    var downloadSpeed: String = ""
+    var downloadETA: String = ""
+
     init(url: String) {
         self.originalURL = url
-        self.youtubeVideoID = VideoItem.extractYouTubeID(from: url)
     }
 
     var sourceDomain: String {
@@ -56,10 +58,6 @@ class VideoItem: Identifiable {
         return false
     }
 
-    var isCompleted: Bool {
-        !recentDownloads.isEmpty
-    }
-
     static func formatTime(_ seconds: Double) -> String {
         let totalSeconds = Int(seconds)
         let h = totalSeconds / 3600
@@ -69,37 +67,5 @@ class VideoItem: Identifiable {
             return String(format: "%d:%02d:%02d", h, m, s)
         }
         return String(format: "%d:%02d", m, s)
-    }
-
-    // MARK: - YouTube ID extraction
-
-    static func extractYouTubeID(from urlString: String) -> String? {
-        guard let url = URL(string: urlString) else { return nil }
-        let host = url.host?.lowercased() ?? ""
-
-        guard host.contains("youtube.com") || host.contains("youtu.be") else {
-            return nil
-        }
-
-        // youtu.be/ID
-        if host.contains("youtu.be") {
-            let id = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            return id.isEmpty ? nil : id
-        }
-
-        // youtube.com/watch?v=ID
-        if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           let v = components.queryItems?.first(where: { $0.name == "v" })?.value {
-            return v
-        }
-
-        // youtube.com/shorts/ID or youtube.com/embed/ID
-        let pathComponents = url.pathComponents
-        if pathComponents.count >= 3 &&
-            (pathComponents[1] == "shorts" || pathComponents[1] == "embed") {
-            return pathComponents[2]
-        }
-
-        return nil
     }
 }

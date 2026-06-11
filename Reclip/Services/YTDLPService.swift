@@ -6,10 +6,23 @@ enum DownloadEvent {
     case failed(error: String)
 }
 
+struct VideoInfo {
+    let title: String
+    let thumbnailURL: URL?
+    let duration: String?
+    let durationSeconds: Double
+    let qualities: [VideoQuality]
+}
+
 struct YTDLPService {
     private let ytdlpPath: String
     private let ffmpegPath: String
     private let log = ConsoleLog.shared
+
+    /// Marker prepended to progress lines so they can be told apart from other
+    /// yt-dlp output. yt-dlp consumes a leading "download:" in the template as
+    /// a template-type selector, so the printed line starts with this marker.
+    static let progressMarker = "RECLIP_PROGRESS|"
 
     /// Environment for subprocesses: ensures yt-dlp can find ffmpeg, deno, and other brew binaries
     /// when the app is launched from Finder (where PATH is normally just /usr/bin:/bin).
@@ -52,58 +65,50 @@ struct YTDLPService {
         }
     }
 
+    private func makeProcess(_ path: String) -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.environment = subprocessEnv
+        return process
+    }
+
+    /// Extracts yt-dlp ERROR lines from stderr, falling back to a generic message.
+    func errorSummary(from stderr: String, fallback: String) -> String {
+        let errorLines = stderr.components(separatedBy: "\n").filter { $0.contains("ERROR") }
+        return errorLines.isEmpty ? fallback : errorLines.joined(separator: "\n")
+    }
+
     // MARK: - Fetch Metadata
 
-    func fetchInfo(url: String) async throws -> (title: String, thumbnailURL: URL?, duration: String?, durationSeconds: Double, qualities: [VideoQuality]) {
+    func fetchInfo(url: String) async throws -> VideoInfo {
         log.log("Fetching metadata for \(url)", level: .info)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: ytdlpPath)
-        process.environment = subprocessEnv
-        let args = ["--dump-json", "--no-download", url]
+        let process = makeProcess(ytdlpPath)
+        let args = ["--dump-json", "--no-download", "--no-playlist", url]
         process.arguments = args
         logCommand(ytdlpPath, args)
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        try process.run()
-
-        let data = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-            DispatchQueue.global().async {
-                let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                if process.terminationStatus != 0 {
-                    let errorData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                    let fullStderr = String(data: errorData, encoding: .utf8) ?? ""
-                    let errorLines = fullStderr.components(separatedBy: "\n")
-                        .filter { $0.contains("ERROR") }
-                    let errorMsg = errorLines.isEmpty ? "yt-dlp failed (exit code \(process.terminationStatus))" : errorLines.joined(separator: "\n")
-                    self.log.log(errorMsg, level: .error)
-                    continuation.resume(throwing: YTDLPError.fetchFailed(errorMsg))
-                } else {
-                    self.log.log("Metadata fetched successfully", level: .success)
-                    continuation.resume(returning: outputData)
-                }
-            }
+        let result = try await runProcess(process)
+        guard result.status == 0 else {
+            let msg = errorSummary(from: result.stderr, fallback: "yt-dlp failed (exit code \(result.status))")
+            log.log(msg, level: .error)
+            throw YTDLPError.fetchFailed(msg)
         }
+        log.log("Metadata fetched successfully", level: .success)
 
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let json = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any] else {
             throw YTDLPError.parseFailed
         }
 
-        let title = json["title"] as? String ?? "Unknown"
-        let thumbnail = (json["thumbnail"] as? String).flatMap { URL(string: $0) }
-        let durationString = json["duration_string"] as? String
-        let durationSeconds = json["duration"] as? Double ?? 0
-
-        let qualities = parseQualities(from: json)
-
-        return (title, thumbnail, durationString, durationSeconds, qualities)
+        return VideoInfo(
+            title: json["title"] as? String ?? "Unknown",
+            thumbnailURL: (json["thumbnail"] as? String).flatMap { URL(string: $0) },
+            duration: json["duration_string"] as? String,
+            durationSeconds: json["duration"] as? Double ?? 0,
+            qualities: parseQualities(from: json)
+        )
     }
 
-    private func parseQualities(from json: [String: Any]) -> [VideoQuality] {
+    func parseQualities(from json: [String: Any]) -> [VideoQuality] {
         guard let formats = json["formats"] as? [[String: Any]] else { return [] }
 
         var qualities: [VideoQuality] = []
@@ -149,19 +154,25 @@ struct YTDLPService {
 
     // MARK: - Download Preview
 
+    static var previewDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("ReclipPreviews")
+    }
+
+    /// Removes preview files left over from previous sessions.
+    static func cleanUpPreviewDirectory() {
+        try? FileManager.default.removeItem(at: previewDirectory)
+    }
+
     /// Downloads a low-res (360p) preview copy for native AVPlayer scrubbing.
     /// Returns the local file URL of the downloaded preview.
     func downloadPreview(url: String) async throws -> URL {
-        let previewDir = FileManager.default.temporaryDirectory.appendingPathComponent("ReclipPreviews")
+        let previewDir = Self.previewDirectory
         try? FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
 
         let uuid = UUID().uuidString
         let outputTemplate = previewDir.appendingPathComponent("\(uuid).%(ext)s").path
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: ytdlpPath)
-        process.environment = subprocessEnv
-
+        let process = makeProcess(ytdlpPath)
         let args = [
             // Strictly prefer h264/avc1 (AVPlayer-compatible). Format 18 is universally
             // available muxed 360p h264+aac mp4. Fall back to merged avc1 video + m4a audio.
@@ -178,205 +189,163 @@ struct YTDLPService {
         log.log("Downloading 360p preview for scrubbing", level: .info)
         logCommand(ytdlpPath, args)
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        // Drain both pipes asynchronously so they never fill up and block the process
-        var stderrBuffer = Data()
-        let stderrQueue = DispatchQueue(label: "reclip.preview.stderr")
-        var stdoutLineBuffer = ""
         let console = log
-
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            stderrQueue.sync { stderrBuffer.append(data) }
-            if let text = String(data: data, encoding: .utf8) {
-                for line in text.components(separatedBy: "\n") where !line.isEmpty {
-                    let level: LogLevel = line.contains("ERROR") ? .error : (line.contains("WARNING") ? .warning : .info)
-                    console.log(line, level: level)
-                }
-            }
-        }
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            stdoutLineBuffer += text
-            let lines = stdoutLineBuffer.components(separatedBy: "\n")
-            stdoutLineBuffer = lines.last ?? ""
-            for line in lines.dropLast() where !line.isEmpty {
+        let result = try await runProcess(
+            process,
+            onStdoutLine: { line in
                 // Skip progress spam but surface destination/merge lines
-                if line.contains("[download]") && line.contains("%") { continue }
+                if line.contains("[download]") && line.contains("%") { return }
                 console.log(line, level: .info)
+            },
+            onStderrLine: { line in
+                let level: LogLevel = line.contains("ERROR") ? .error : (line.contains("WARNING") ? .warning : .info)
+                console.log(line, level: level)
             }
+        )
+
+        guard result.status == 0 else {
+            let msg = errorSummary(from: result.stderr, fallback: "Preview download failed (exit \(result.status))")
+            log.log("Preview download failed: \(msg)", level: .error)
+            throw YTDLPError.fetchFailed(msg)
         }
 
-        try process.run()
-
-        let fileURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
-            DispatchQueue.global().async {
-                process.waitUntilExit()
-
-                stderrPipe.fileHandleForReading.readabilityHandler = nil
-                stdoutPipe.fileHandleForReading.readabilityHandler = nil
-
-                if process.terminationStatus != 0 {
-                    let errorStr = stderrQueue.sync { String(data: stderrBuffer, encoding: .utf8) ?? "" }
-                    let errorLines = errorStr.components(separatedBy: "\n")
-                        .filter { $0.contains("ERROR") }
-                    let msg = errorLines.isEmpty
-                        ? "Preview download failed (exit \(process.terminationStatus))"
-                        : errorLines.joined(separator: "\n")
-                    self.log.log("Preview download failed: \(msg)", level: .error)
-                    continuation.resume(throwing: YTDLPError.fetchFailed(msg))
-                } else {
-                    // Find the output file (extension may vary)
-                    if let files = try? FileManager.default.contentsOfDirectory(at: previewDir, includingPropertiesForKeys: nil),
-                       let match = files.first(where: { $0.lastPathComponent.hasPrefix(uuid) }) {
-                        self.log.log("Preview ready: \(match.lastPathComponent)", level: .success)
-                        continuation.resume(returning: match)
-                    } else {
-                        self.log.log("Preview file not found after download", level: .error)
-                        continuation.resume(throwing: YTDLPError.fetchFailed("Preview file not found after download"))
-                    }
-                }
-            }
+        // Find the output file (extension may vary)
+        guard let files = try? FileManager.default.contentsOfDirectory(at: previewDir, includingPropertiesForKeys: nil),
+              let match = files.first(where: { $0.lastPathComponent.hasPrefix(uuid) }) else {
+            log.log("Preview file not found after download", level: .error)
+            throw YTDLPError.fetchFailed("Preview file not found after download")
         }
-
-        return fileURL
+        log.log("Preview ready: \(match.lastPathComponent)", level: .success)
+        return match
     }
 
     // MARK: - Download
 
     func download(url: String, quality: VideoQuality?, outputDir: URL, format: DownloadFormat, clipRange: (start: Double, end: Double)? = nil) -> AsyncStream<DownloadEvent> {
         AsyncStream { continuation in
+            let process = makeProcess(ytdlpPath)
+            let cancelled = AtomicFlag()
+
+            // If the consumer stops iterating (user hit Cancel), kill yt-dlp.
+            continuation.onTermination = { reason in
+                guard case .cancelled = reason else { return }
+                cancelled.set()
+                if process.isRunning { process.terminate() }
+            }
+
             Task {
-                do {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: ytdlpPath)
-                    process.environment = subprocessEnv
+                var args: [String] = []
 
-                    var args: [String] = []
-
-                    switch format {
-                    case .mp4:
-                        if let quality {
-                            args += ["-f", "\(quality.id)+bestaudio/best"]
-                        } else {
-                            args += ["-f", "bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best"]
-                        }
-                        args += ["--merge-output-format", "mp4"]
-                    case .mp3:
-                        args += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
-                    }
-
-                    // Clip range support
-                    var clipSuffix = ""
-                    if let clip = clipRange {
-                        let startStr = formatSeconds(clip.start)
-                        let endStr = formatSeconds(clip.end)
-                        args += ["--download-sections", "*\(startStr)-\(endStr)"]
-                        // Force keyframes for clean cuts
-                        args += ["--force-keyframes-at-cuts"]
-                        // Build a filename-safe suffix like " [clip 00.18 to 12.35]"
-                        // (colons aren't allowed in macOS filenames)
-                        let safeStart = formatFilenameTimestamp(clip.start)
-                        let safeEnd = formatFilenameTimestamp(clip.end)
-                        clipSuffix = " [clip \(safeStart) to \(safeEnd)]"
-                    }
-
-                    let outputTemplate = outputDir.appendingPathComponent("%(title)s\(clipSuffix).%(ext)s").path
-                    args += ["-o", outputTemplate, "--newline", "--no-overwrites"]
-                    args += ["--progress-template", "download:%(progress._percent_str)s|||%(progress._speed_str)s|||%(progress._eta_str)s"]
-                    args += ["--print", "after_move:FILEPATH:%(filepath)s"]
-                    args += [url]
-
-                    process.arguments = args
-
-                    let clipDescription: String
-                    if let clip = clipRange {
-                        clipDescription = " clip \(formatSeconds(clip.start))–\(formatSeconds(clip.end))"
+                switch format {
+                case .mp4:
+                    if let quality {
+                        args += ["-f", "\(quality.id)+bestaudio/best"]
                     } else {
-                        clipDescription = ""
+                        args += ["-f", "bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best"]
                     }
-                    log.log("Starting \(format == .mp4 ? "MP4" : "MP3") download\(clipDescription)", level: .info)
-                    logCommand(ytdlpPath, args)
+                    args += ["--merge-output-format", "mp4"]
+                case .mp3:
+                    args += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+                }
 
-                    let stdoutPipe = Pipe()
-                    let stderrPipe = Pipe()
-                    process.standardOutput = stdoutPipe
-                    process.standardError = stderrPipe
+                // Clip range support
+                var clipSuffix = ""
+                if let clip = clipRange {
+                    let startStr = formatSeconds(clip.start)
+                    let endStr = formatSeconds(clip.end)
+                    args += ["--download-sections", "*\(startStr)-\(endStr)"]
+                    // Force keyframes for clean cuts
+                    args += ["--force-keyframes-at-cuts"]
+                    // Build a filename-safe suffix like " [clip 00.18 to 12.35]"
+                    // (colons aren't allowed in macOS filenames)
+                    let safeStart = formatFilenameTimestamp(clip.start)
+                    let safeEnd = formatFilenameTimestamp(clip.end)
+                    clipSuffix = " [clip \(safeStart) to \(safeEnd)]"
+                }
 
-                    var buffer = ""
-                    var stderrBuf = ""
-                    var downloadedFilePath: String?
+                let outputTemplate = outputDir.appendingPathComponent("%(title)s\(clipSuffix).%(ext)s").path
+                args += ["-o", outputTemplate, "--newline", "--no-overwrites", "--no-playlist"]
+                // --print implies --quiet, which suppresses progress output;
+                // --progress re-enables it. Without this no progress is emitted.
+                args += ["--progress", "--progress-template", "download:\(Self.progressMarker)%(progress._percent_str)s|||%(progress._speed_str)s|||%(progress._eta_str)s"]
+                args += ["--print", "after_move:FILEPATH:%(filepath)s"]
+                args += [url]
+
+                process.arguments = args
+
+                let clipDescription: String
+                if let clip = clipRange {
+                    clipDescription = " clip \(formatSeconds(clip.start))–\(formatSeconds(clip.end))"
+                } else {
+                    clipDescription = ""
+                }
+                log.log("Starting \(format == .mp4 ? "MP4" : "MP3") download\(clipDescription)", level: .info)
+                logCommand(ytdlpPath, args)
+
+                guard !cancelled.isSet else {
+                    continuation.finish()
+                    return
+                }
+
+                do {
                     let console = log
-
-                    stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-                        let data = handle.availableData
-                        guard !data.isEmpty else { return }
-                        guard let text = String(data: data, encoding: .utf8) else { return }
-
-                        buffer += text
-                        let lines = buffer.components(separatedBy: "\n")
-                        buffer = lines.last ?? ""
-
-                        for line in lines.dropLast() {
-                            if line.hasPrefix("FILEPATH:") {
-                                downloadedFilePath = String(line.dropFirst("FILEPATH:".count))
-                                console.log("Saved: \(line.dropFirst("FILEPATH:".count))", level: .success)
-                            } else if line.hasPrefix("download:") {
-                                // Progress line — don't spam the console
+                    let result = try await runProcess(
+                        process,
+                        onStdoutLine: { line in
+                            if line.contains(Self.progressMarker) {
+                                // Progress line — yield an event, don't spam the console
                                 if let event = self.parseProgress(line) {
                                     continuation.yield(event)
                                 }
+                            } else if line.hasPrefix("FILEPATH:") {
+                                // Final path is parsed from collected output after exit
                             } else if !line.trimmingCharacters(in: .whitespaces).isEmpty {
                                 console.log(line, level: .info)
                             }
-                        }
-                    }
-
-                    stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-                        let data = handle.availableData
-                        guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                        stderrBuf += text
-                        let lines = stderrBuf.components(separatedBy: "\n")
-                        stderrBuf = lines.last ?? ""
-                        for line in lines.dropLast() where !line.isEmpty {
+                        },
+                        onStderrLine: { line in
                             let level: LogLevel = line.contains("ERROR") ? .error : (line.contains("WARNING") ? .warning : .info)
                             console.log(line, level: level)
                         }
+                    )
+
+                    if cancelled.isSet {
+                        log.log("Download cancelled", level: .warning)
+                        continuation.finish()
+                        return
                     }
 
-                    try process.run()
+                    if result.status == 0 {
+                        // Parse FILEPATH from the collected output rather than the
+                        // streaming callback so a line emitted just before exit
+                        // can't be lost to a pipe-drain race.
+                        let downloadedFilePath = String(decoding: result.stdout, as: UTF8.self)
+                            .components(separatedBy: .newlines)
+                            .last { $0.hasPrefix("FILEPATH:") }
+                            .map { String($0.dropFirst("FILEPATH:".count)) }
 
-                    process.waitUntilExit()
+                        if let filePath = downloadedFilePath {
+                            log.log("Saved: \(filePath)", level: .success)
+                        }
 
-                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                    stderrPipe.fileHandleForReading.readabilityHandler = nil
-
-                    if process.terminationStatus == 0 {
                         if let filePath = downloadedFilePath, format == .mp4 {
                             let needsTranscode = quality != nil && !quality!.isH264
-                            continuation.yield(.progress(percent: 100, speed: "", eta: needsTranscode ? "Repackaging..." : ""))
+                            continuation.yield(.progress(percent: 100, speed: "", eta: ""))
                             if needsTranscode {
                                 log.log("Transcoding VP9 → HEVC for QuickTime compatibility", level: .info)
                             } else {
                                 log.log("Repackaging MP4 for QuickTime", level: .info)
                             }
-                            self.repackageForQuickTime(filePath: filePath, needsTranscode: needsTranscode)
-                            log.log("Repackaging complete", level: .success)
+                            if await repackageForQuickTime(filePath: filePath, needsTranscode: needsTranscode) {
+                                log.log("Repackaging complete", level: .success)
+                            } else {
+                                log.log("Repackaging failed — keeping the file as downloaded", level: .warning)
+                            }
                         }
                         log.log("Download complete", level: .success)
-                        let finalURL = downloadedFilePath.map { URL(fileURLWithPath: $0) }
-                        continuation.yield(.completed(fileURL: finalURL))
+                        continuation.yield(.completed(fileURL: downloadedFilePath.map { URL(fileURLWithPath: $0) }))
                     } else {
-                        let fullStderr = stderrBuf
-                        let errorLines = fullStderr.components(separatedBy: "\n")
-                            .filter { $0.contains("ERROR") }
-                        let errorMsg = errorLines.isEmpty ? "Download failed (exit code \(process.terminationStatus))" : errorLines.joined(separator: "\n")
+                        let errorMsg = errorSummary(from: result.stderr, fallback: "Download failed (exit code \(result.status))")
                         log.log("Download failed: \(errorMsg)", level: .error)
                         continuation.yield(.failed(error: errorMsg))
                     }
@@ -389,7 +358,7 @@ struct YTDLPService {
         }
     }
 
-    private func formatSeconds(_ seconds: Double) -> String {
+    func formatSeconds(_ seconds: Double) -> String {
         let totalSeconds = Int(seconds)
         let h = totalSeconds / 3600
         let m = (totalSeconds % 3600) / 60
@@ -399,7 +368,7 @@ struct YTDLPService {
 
     /// Returns a timestamp suitable for inclusion in a filename (no colons).
     /// Under 1h: "MM.SS"; otherwise: "H.MM.SS".
-    private func formatFilenameTimestamp(_ seconds: Double) -> String {
+    func formatFilenameTimestamp(_ seconds: Double) -> String {
         let totalSeconds = Int(seconds)
         let h = totalSeconds / 3600
         let m = (totalSeconds % 3600) / 60
@@ -411,11 +380,10 @@ struct YTDLPService {
     }
 
     /// Repackage downloaded MP4 for QuickTime compatibility.
-    private func repackageForQuickTime(filePath: String, needsTranscode: Bool) {
+    /// Returns false if ffmpeg failed; the original file is kept in that case.
+    private func repackageForQuickTime(filePath: String, needsTranscode: Bool) async -> Bool {
         let tempPath = filePath + ".repack.mp4"
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: ffmpegPath)
-        process.environment = subprocessEnv
+        let process = makeProcess(ffmpegPath)
 
         if needsTranscode {
             process.arguments = ["-y", "-i", filePath, "-c:v", "hevc_videotoolbox", "-q:v", "65", "-tag:v", "hvc1", "-c:a", "copy", "-movflags", "+faststart", tempPath]
@@ -423,31 +391,32 @@ struct YTDLPService {
             process.arguments = ["-y", "-i", filePath, "-c", "copy", "-movflags", "+faststart", tempPath]
         }
 
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
         do {
-            try process.run()
-            process.waitUntilExit()
-
-            if process.terminationStatus == 0 {
-                try? FileManager.default.removeItem(atPath: filePath)
-                try? FileManager.default.moveItem(atPath: tempPath, toPath: filePath)
+            let result = try await runProcess(process)
+            if result.status == 0 {
+                try FileManager.default.removeItem(atPath: filePath)
+                try FileManager.default.moveItem(atPath: tempPath, toPath: filePath)
+                return true
             } else {
+                let tail = result.stderr.components(separatedBy: "\n")
+                    .filter { !$0.isEmpty }
+                    .suffix(3)
+                    .joined(separator: "\n")
+                log.log("ffmpeg exited with code \(result.status): \(tail)", level: .error)
                 try? FileManager.default.removeItem(atPath: tempPath)
+                return false
             }
         } catch {
+            log.log("ffmpeg failed to run: \(error.localizedDescription)", level: .error)
             try? FileManager.default.removeItem(atPath: tempPath)
+            return false
         }
     }
 
-    private func parseProgress(_ line: String) -> DownloadEvent? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("download:") else { return nil }
-
-        let content = String(trimmed.dropFirst("download:".count))
+    func parseProgress(_ line: String) -> DownloadEvent? {
+        guard let markerRange = line.range(of: Self.progressMarker) else { return nil }
+        let content = String(line[markerRange.upperBound...])
         let parts = content.components(separatedBy: "|||")
-        guard parts.count >= 1 else { return nil }
 
         let percentStr = parts[0].trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "%", with: "")
         guard let percent = Double(percentStr) else { return nil }

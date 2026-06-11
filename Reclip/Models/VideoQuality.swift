@@ -13,9 +13,11 @@ struct VideoQuality: Identifiable, Hashable {
     }
 
     var displayLabel: String {
+        // Size is the video stream only — the merged-in audio adds a bit more,
+        // so present it as approximate.
         if let filesize, filesize > 0 {
             let mb = Double(filesize) / 1_000_000
-            return "\(resolution) (\(String(format: "%.0f", mb)) MB)"
+            return "\(resolution) (~\(String(format: "%.0f", mb)) MB)"
         }
         return resolution
     }

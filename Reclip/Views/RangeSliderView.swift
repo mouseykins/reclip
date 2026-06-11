@@ -16,6 +16,11 @@ struct RangeSliderView: View {
             let startFraction = totalRange > 0 ? (start - range.lowerBound) / totalRange : 0
             let endFraction = totalRange > 0 ? (end - range.lowerBound) / totalRange : 1
 
+            // Note: the thumb DragGestures below rely on .offset being purely
+            // visual — gesture locations are reported in the thumb's *un-offset*
+            // layout frame (the leading edge of this ZStack), so location.x is
+            // already the position along the track. Don't switch to .position
+            // without reworking the math.
             ZStack(alignment: .leading) {
                 // Background track
                 RoundedRectangle(cornerRadius: trackHeight / 2)

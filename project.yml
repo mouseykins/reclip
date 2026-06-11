@@ -16,12 +16,14 @@ targets:
         LSApplicationCategoryType: public.app-category.utilities
         CFBundleIconFile: AppIcon
         CFBundleIconName: AppIcon
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
     settings:
       base:
         PRODUCT_NAME: Reclip
         PRODUCT_BUNDLE_IDENTIFIER: com.reclip.app
-        MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.1.0"
+        CURRENT_PROJECT_VERSION: "2"
         SWIFT_VERSION: "5.9"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -29,3 +31,30 @@ targets:
         CODE_SIGN_STYLE: Manual
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: NO
+
+  ReclipTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ReclipTests
+    dependencies:
+      - target: Reclip
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.reclip.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+
+schemes:
+  Reclip:
+    build:
+      targets:
+        Reclip: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ReclipTests

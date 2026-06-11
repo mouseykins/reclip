@@ -249,7 +249,7 @@ struct ContentView: View {
             // Download buttons
             HStack(spacing: 12) {
                 Button {
-                    Task { await viewModel.downloadFull() }
+                    viewModel.downloadFull()
                 } label: {
                     Label("Download Full", systemImage: "arrow.down.to.line")
                 }
@@ -259,7 +259,7 @@ struct ContentView: View {
 
                 let isClipped = item.clipStart > 0 || item.clipEnd < item.durationSeconds
                 Button {
-                    Task { await viewModel.downloadClip() }
+                    viewModel.downloadClip()
                 } label: {
                     Label(
                         "Download Clip (\(VideoItem.formatTime(item.clipStart)) — \(VideoItem.formatTime(item.clipEnd)))",
@@ -359,11 +359,33 @@ struct ContentView: View {
             }
 
         case .downloading(let progress):
-            HStack {
-                ProgressView()
-                    .scaleEffect(0.7)
-                Text(progress >= 100 ? "Repackaging for QuickTime..." : "Downloading...")
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                if progress >= 100 {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                    Text("Repackaging for QuickTime...")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView(value: min(max(progress, 0), 100), total: 100)
+                        .frame(maxWidth: 240)
+                    Text(String(format: "%.0f%%", progress))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    if !item.downloadSpeed.isEmpty {
+                        Text(item.downloadSpeed)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    if !item.downloadETA.isEmpty {
+                        Text("ETA \(item.downloadETA)")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Cancel") {
+                        viewModel.cancelDownload()
+                    }
+                    .controlSize(.small)
+                }
             }
 
         case .failed(let error):
@@ -386,7 +408,7 @@ struct ContentView: View {
                 Spacer()
 
                 Button("Clear") {
-                    viewModel.clear()
+                    clear()
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -429,6 +451,13 @@ struct ContentView: View {
     // MARK: - Actions
 
     private func fetch() {
+        // Stop the old preview's audio before its view is replaced.
+        playerController.pause()
         Task { await viewModel.fetchVideo() }
+    }
+
+    private func clear() {
+        playerController.pause()
+        viewModel.clear()
     }
 }

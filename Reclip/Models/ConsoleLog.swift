@@ -35,10 +35,16 @@ struct LogEntry: Identifiable {
     let level: LogLevel
     let message: String
 
-    var formattedTimestamp: String {
+    // DateFormatter is expensive to create — share one across all rows.
+    // Only accessed from the main thread (console rendering + copy button).
+    private static let timestampFormatter: DateFormatter = {
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm:ss"
-        return fmt.string(from: timestamp)
+        return fmt
+    }()
+
+    var formattedTimestamp: String {
+        Self.timestampFormatter.string(from: timestamp)
     }
 }
 

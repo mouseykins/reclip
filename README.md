@@ -84,6 +84,12 @@ xcodebuild -project Reclip.xcodeproj -scheme Reclip -configuration Release build
 cp -R ~/Library/Developer/Xcode/DerivedData/Reclip-*/Build/Products/Release/Reclip.app /Applications/
 ```
 
+Run the unit tests with:
+
+```bash
+xcodebuild test -project Reclip.xcodeproj -scheme Reclip
+```
+
 ## Project layout
 
 ```
@@ -91,10 +97,11 @@ Reclip/
 ├── ReclipApp.swift              # @main entry point
 ├── ContentView.swift            # Top-level layout
 ├── Models/                      # VideoItem, VideoQuality, DownloadFormat, ConsoleLog
-├── Services/                    # YTDLPService, DependencyCheck
+├── Services/                    # YTDLPService, ProcessRunner, ProcessRegistry, DependencyCheck
 ├── ViewModels/                  # DownloadListViewModel
 ├── Views/                       # VideoEmbedView, RangeSliderView, ConsoleView, SetupView
 └── Resources/Assets.xcassets    # App icon
+ReclipTests/                     # Unit tests (process I/O, parsing, models)
 ```
 
 ## Why these choices?
